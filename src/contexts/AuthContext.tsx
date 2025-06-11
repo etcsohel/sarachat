@@ -9,14 +9,14 @@ import type { UserProfile, AuthUser } from "@/types";
 import { getUserProfile, createUserProfile, updateUserProfile } from "@/lib/firebase/firestore";
 import { generateRsaKeyPair, exportKeyToJwk } from "@/lib/crypto";
 import { storePrivateKey, getPrivateKey, storePublicKey, getPublicKey } from "@/lib/indexedDB";
-// import { Loader2 } from "lucide-react"; // Temporarily remove for debugging
+import { Loader2 } from "lucide-react";
 
 interface AuthContextType {
   user: AuthUser | null;
   loading: boolean;
   error: Error | null;
   userKeys: { publicKey: JsonWebKey | null; privateKey: CryptoKey | null } | null;
-  ensureKeys: () => Promise<void>;
+  ensureKeys: (isManualTrigger?: boolean) => Promise<void>;
 }
 
 export const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -39,63 +39,76 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       let localPrivateKey = await getPrivateKey(currentUserForKeys.uid);
       let localPublicKeyJwk = await getPublicKey(currentUserForKeys.uid);
+      let firestorePublicKeyJwk: JsonWebKey | undefined = undefined;
+
+      let userProfileForKeys = currentUserForKeys.profile;
+      if (!userProfileForKeys) { // Fetch profile if not already part of authUserParam or current user state
+        userProfileForKeys = await getUserProfile(currentUserForKeys.uid);
+      }
+      if (userProfileForKeys?.publicKey) {
+        firestorePublicKeyJwk = userProfileForKeys.publicKey;
+      }
 
       if (localPrivateKey && localPublicKeyJwk) {
+        // Scenario 1: Keys found locally. This device's keys are primary.
         setUserKeys({ privateKey: localPrivateKey, publicKey: localPublicKeyJwk });
-        let profileToUpdate = currentUserForKeys.profile;
-        if (!profileToUpdate) {
-            profileToUpdate = await getUserProfile(currentUserForKeys.uid);
-        }
 
-        if (profileToUpdate && (!profileToUpdate.publicKey || JSON.stringify(profileToUpdate.publicKey) !== JSON.stringify(localPublicKeyJwk))) {
-            console.log("AuthContext: Updating Firestore profile with locally found public key for user:", currentUserForKeys.uid);
-            await updateUserProfile(currentUserForKeys.uid, { publicKey: localPublicKeyJwk });
-            const refreshedProfile = await getUserProfile(currentUserForKeys.uid);
-            if (refreshedProfile) {
-                if (user && user.uid === currentUserForKeys.uid) {
-                    setUser(prev => prev ? ({ ...prev, profile: refreshedProfile }) : null);
-                }
-            }
+        // Ensure Firestore has this local public key if it's missing or different.
+        if (!firestorePublicKeyJwk || JSON.stringify(firestorePublicKeyJwk) !== JSON.stringify(localPublicKeyJwk)) {
+          console.log(`AuthContext: Updating Firestore public key for user ${currentUserForKeys.uid} to match local key.`);
+          await updateUserProfile(currentUserForKeys.uid, { publicKey: localPublicKeyJwk });
+          
+          const refreshedProfile = await getUserProfile(currentUserForKeys.uid);
+          if (user && user.uid === currentUserForKeys.uid) { // Update current user state if it's the active user
+            setUser(prev => prev ? ({ ...prev, profile: refreshedProfile || prev.profile }) : null);
+          } else if (authUserParam && authUserParam.uid === currentUserForKeys.uid) { // Update authUserParam if it was passed
+             if(refreshedProfile) authUserParam.profile = refreshedProfile;
+          }
+        }
+        return; // Local keys are good and synced.
+      }
+
+      // Scenario 2: Local private key is missing.
+      if (firestorePublicKeyJwk) {
+        // Public key exists in Firestore. Use it. Private key for this device is considered lost/not present.
+        console.warn(`AuthContext: Public key for user ${currentUserForKeys.uid} found in Firestore, but private key is missing locally on this device. Decryption/Encryption may not be possible from this device.`);
+        setUserKeys({ privateKey: null, publicKey: firestorePublicKeyJwk });
+        // If local public key store was somehow out of sync or empty, ensure it stores the Firestore one.
+        if (!localPublicKeyJwk || JSON.stringify(localPublicKeyJwk) !== JSON.stringify(firestorePublicKeyJwk)) {
+            await storePublicKey(currentUserForKeys.uid, firestorePublicKeyJwk);
         }
         return;
       }
-      
-      let userProfileForKeys = currentUserForKeys.profile;
-      if (!userProfileForKeys) {
-        const profileData = await getUserProfile(currentUserForKeys.uid);
-        if (profileData) userProfileForKeys = profileData;
-      }
 
-      if (userProfileForKeys?.publicKey && !localPrivateKey) {
-        console.warn("AuthContext: Public key found in Firestore, but private key missing locally. Re-generating keys for this device.");
-      }
-
-      console.log("AuthContext: Generating new key pair for user:", currentUserForKeys.uid);
+      // Scenario 3: No keys locally AND no public key in Firestore.
+      // This indicates a fresh setup for the user or keys were wiped from all known sources.
+      console.log("AuthContext: No local keys and no public key in Firestore. Generating new key pair for user:", currentUserForKeys.uid);
       const { publicKey: newPublicKeyCrypto, privateKey: newPrivateKeyCrypto } = await generateRsaKeyPair();
-      const newPublicKeyJwk = await exportKeyToJwk(newPublicKeyCrypto);
+      const newGeneratedPublicKeyJwk = await exportKeyToJwk(newPublicKeyCrypto);
 
       await storePrivateKey(currentUserForKeys.uid, newPrivateKeyCrypto);
-      await storePublicKey(currentUserForKeys.uid, newPublicKeyJwk);
-      setUserKeys({ privateKey: newPrivateKeyCrypto, publicKey: newPublicKeyJwk });
+      await storePublicKey(currentUserForKeys.uid, newGeneratedPublicKeyJwk);
+      setUserKeys({ privateKey: newPrivateKeyCrypto, publicKey: newGeneratedPublicKeyJwk });
 
-      console.log("AuthContext: Updating/Creating Firestore profile with new public key for user:", currentUserForKeys.uid);
-      let updatedProfile;
-      if (userProfileForKeys) {
-        await updateUserProfile(currentUserForKeys.uid, { publicKey: newPublicKeyJwk });
-        updatedProfile = await getUserProfile(currentUserForKeys.uid); 
-      } else {
-        updatedProfile = await createUserProfile(currentUserForKeys, newPublicKeyJwk, currentUserForKeys.displayName || undefined);
+      // Update/Create Firestore profile with the new public key
+      let finalProfileAfterKeyGen;
+      if (userProfileForKeys) { // Profile exists but didn't have a public key
+        await updateUserProfile(currentUserForKeys.uid, { publicKey: newGeneratedPublicKeyJwk });
+        finalProfileAfterKeyGen = await getUserProfile(currentUserForKeys.uid);
+      } else { // No profile existed (or was fetched and was null)
+        finalProfileAfterKeyGen = await createUserProfile(currentUserForKeys, newGeneratedPublicKeyJwk, currentUserForKeys.displayName || undefined);
       }
       
-      if (user && user.uid === currentUserForKeys.uid) {
-         setUser(prevUser => prevUser ? { ...prevUser, profile: updatedProfile || prevUser.profile } : null);
-      } else if (authUserParam && authUserParam.uid === currentUserForKeys.uid) {
-        // Profile will be attached in onAuthStateChanged
+      if (user && user.uid === currentUserForKeys.uid) { // Update current user state
+         setUser(prevUser => prevUser ? { ...prevUser, profile: finalProfileAfterKeyGen || prevUser.profile } : null);
+      } else if (authUserParam && authUserParam.uid === currentUserForKeys.uid) { // Update authUserParam if it was passed
+         if(finalProfileAfterKeyGen) authUserParam.profile = finalProfileAfterKeyGen;
       }
 
     } catch (err) {
       console.error("AuthContext: Error managing user keys:", err);
       setError(err instanceof Error ? err : new Error("Failed to manage keys"));
+      setUserKeys(null); // Ensure keys are null on error to prevent inconsistent state
     }
   };
 
@@ -106,13 +119,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setError(null);
       if (firebaseUser) {
         try {
+          // Fetch profile first, as ensureKeys might need it if not on firebaseUser.
           let profile = await getUserProfile(firebaseUser.uid);
           const authUser: AuthUser = { ...firebaseUser, profile: profile || undefined };
-          setUser(authUser); 
-          await ensureKeys(authUser); 
-
-           const finalProfile = await getUserProfile(firebaseUser.uid);
-           setUser(prev => prev ? {...prev, profile: finalProfile || prev.profile} : null);
+          
+          await ensureKeys(authUser); // Pass the fetched authUser with its profile
+          
+          // Re-fetch profile after ensureKeys, as it might have updated it.
+          const finalProfile = await getUserProfile(firebaseUser.uid);
+          setUser({ ...authUser, profile: finalProfile || authUser.profile });
 
         } catch (err) {
           console.error("AuthContext: Error during auth state change processing:", err);
@@ -140,18 +155,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   if (!hasMounted) {
     return (
-      <div className="flex h-screen w-screen items-center justify-center">
-        {/* <Loader2 className="h-12 w-12 animate-spin text-primary" /> */}
-        <p className="text-lg">Initializing (Server/Initial Client)...</p>
+      <div className="flex flex-col h-screen w-screen items-center justify-center bg-background text-foreground">
+        <Loader2 className="h-16 w-16 animate-spin text-primary mb-4" />
+        <p className="text-lg">Initializing CipherComms...</p>
       </div>
     );
   }
 
   if (loading && !user) { 
     return (
-      <div className="flex h-screen w-screen items-center justify-center">
-        {/* <Loader2 className="h-12 w-12 animate-spin text-primary" /> */}
-        <p className="text-lg">Loading User Data (Client)...</p>
+      <div className="flex flex-col h-screen w-screen items-center justify-center bg-background text-foreground">
+        <Loader2 className="h-16 w-16 animate-spin text-primary mb-4" />
+        <p className="text-lg">Loading Session...</p>
       </div>
     );
   }
@@ -162,3 +177,4 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     </AuthContext.Provider>
   );
 }
+
