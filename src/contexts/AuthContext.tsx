@@ -157,7 +157,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return (
       <div className="flex flex-col h-screen w-screen items-center justify-center bg-background text-foreground">
         <Loader2 className="h-16 w-16 animate-spin text-primary mb-4" />
-        <p className="text-lg">Initializing CipherComms...</p>
+        <p className="text-lg">Initializing SaraChat...</p>
       </div>
     );
   }
